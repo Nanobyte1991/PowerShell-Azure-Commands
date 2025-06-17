@@ -13,7 +13,7 @@ if (-not (Get-Module -ListAvailable -Name Microsoft.Graph)) {
 }
 
 # Ensure Microsoft.Graph.Users is installed
-if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Users)) {
+if (-not (Get-Module -Name Microsoft.Graph.Users)) {
     Write-Host "Microsoft.Graph.Users module not found. Installing..."
     Install-Module Microsoft.Graph.Users -Scope CurrentUser -Force
 } else {
@@ -32,7 +32,7 @@ Write-Host "`nModules imported:"
 Get-Module Microsoft.Graph*
 
 # Pull down for Module Check if the module is installed
-if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Users)) {
+if (-not (Get-Module -Name Microsoft.Graph.Users)) {
     Write-Host "Microsoft.Graph.Users module not found. Installing..."
     Install-Module Microsoft.Graph.Users -Scope CurrentUser -Force
 } else {
