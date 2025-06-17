@@ -1,8 +1,52 @@
 # ReportMFAStatusUsers.
-# https://github.com/12Knocksinna/Office365itpros/blob/master/ReportMFAStatusUsers.PS1
+# https://github.com/12Knocksinna/Office365itpros/blob/master/ReportMFAStatusUsers.PS1 - Orignal strcipt credit
 # A script to report the authentication methods used by Azure AD user accounts
-# Updated for SDK V2 5-Jan-2024
+# Updated by Nano - 17th June
 
+# Pull down Module for MgGraph
+# Ensure Microsoft.Graph is installed
+if (-not (Get-Module -ListAvailable -Name Microsoft.Graph)) {
+    Write-Host "Microsoft.Graph module not found. Installing..."
+    Install-Module Microsoft.Graph -Scope CurrentUser -Force
+} else {
+    Write-Host "Microsoft.Graph module is already installed."
+}
+
+# Ensure Microsoft.Graph.Users is installed
+if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Users)) {
+    Write-Host "Microsoft.Graph.Users module not found. Installing..."
+    Install-Module Microsoft.Graph.Users -Scope CurrentUser -Force
+} else {
+    Write-Host "Microsoft.Graph.Users module is already installed."
+}
+
+# Remove all Microsoft.Graph modules from memory to avoid function overflow
+Get-Module Microsoft.Graph* | Remove-Module -Force -ErrorAction SilentlyContinue
+
+# Import the required modules
+Import-Module Microsoft.Graph -Force
+Import-Module Microsoft.Graph.Users -Force
+
+# Confirm imports
+Write-Host "`nModules imported:"
+Get-Module Microsoft.Graph*
+
+# Pull down for Module Check if the module is installed
+if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Users)) {
+    Write-Host "Microsoft.Graph.Users module not found. Installing..."
+    Install-Module Microsoft.Graph.Users -Scope CurrentUser -Force
+} else {
+    Write-Host "Microsoft.Graph.Users module is already installed."
+}
+
+# Remove any currently loaded Microsoft.Graph modules to prevent function overflow
+Get-Module Microsoft.Graph* | Remove-Module -Force -ErrorAction SilentlyContinue
+
+# Import only the required module
+Import-Module Microsoft.Graph.Users -Force
+
+# Confirm it's loaded
+Write-Host "Microsoft.Graph.Users module is now imported."
 
 # Connect to the Microsoft Graph SDK for PowerShell
 Connect-MgGraph -Scope UserAuthenticationMethod.Read.All, Directory.Read.All, User.Read.All, Auditlog.Read.All, UserAuthenticationMethod.Read.All
