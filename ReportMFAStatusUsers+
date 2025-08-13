@@ -1,162 +1,136 @@
-<#
-.SYNOPSIS
-    Reports the MFA methods used by Azure AD (Entra ID) users, along with license status and recent sign-in data.
+# ===== MFA Methods + License Check (no premium license required) =====
+# Outputs: GridView + CSV (MFA-Methods-PerUser.csv)
 
-.DESCRIPTION
-    This script connects to Microsoft Graph, filters for member user accounts (excluding guests),
-    checks for MFA methods in use, determines sign-in activity, and evaluates whether users meet
-    strong authentication criteria. The result is output to both GridView and CSV.
+$CsvOutput = "MFA-Methods-PerUser.csv"
 
-.NOTES
-    - Original script by Office365ITPros: https://github.com/12Knocksinna/Office365itpros/blob/master/ReportMFAStatusUsers.PS1
-    - Adapted and improved by Nano, 17th June 2025.
-    - Requires Microsoft.Graph and Microsoft.Graph.Users modules.
-    - Output file: ReportMFAStatusUsers.csv
-    - Use only after validating in a non-production environment.
-    - More info: https://office365itpros.com | https://www.practical365.com
-#>
-
-# Optional: specify output filename
-$CsvOutput = "ReportMFAStatusUsers.csv"
-
-# Ensure Microsoft.Graph module is installed
-if (-not (Get-Module -ListAvailable -Name Microsoft.Graph)) {
-    Write-Host "Installing Microsoft.Graph module..."
-    Install-Module Microsoft.Graph -Scope CurrentUser -Force
-} else {
-    Write-Host "Microsoft.Graph module already installed."
-}
-
-# Remove any loaded Graph modules to avoid conflicts
+# Clean load of Graph
 Get-Module Microsoft.Graph* | Remove-Module -Force -ErrorAction SilentlyContinue
-
-# Import required module
+Import-Module Microsoft.Graph.Authentication -Force
 Import-Module Microsoft.Graph.Users -Force
 
-Write-Host "`nModules imported:"
-Get-Module Microsoft.Graph*
+# Connect (needs admin consent). To read other users' methods you also need the
+# Authentication Administrator (or Privileged Auth Admin / Global Admin) role.
+Connect-MgGraph -Scopes "UserAuthenticationMethod.Read.All","Directory.Read.All","User.Read.All"
 
-# Connect to Microsoft Graph
-Connect-MgGraph -Scope UserAuthenticationMethod.Read.All, Directory.Read.All, User.Read.All, AuditLog.Read.All
+Write-Host "Scopes: $((Get-MgContext).Scopes -join ', ')"
 
-# Get all Entra ID member users (exclude guests)
-Write-Host "`nRetrieving member user accounts..."
-[array]$Users = Get-MgUser -All -Filter "UserType eq 'Member'"
+# --- Friendly name map for common SKUs (extend as you like) ---
+$SkuMap = @{
+  "ENTERPRISEPACK"                  = "Office 365 E3"
+  "ENTERPRISEPREMIUM"               = "Office 365 E5 (old)"
+  "SPE_E3"                          = "Microsoft 365 E3"
+  "SPE_E5"                          = "Microsoft 365 E5"
+  "STANDARDPACK"                    = "Office 365 E1"
+  "O365_BUSINESS_ESSENTIALS"        = "Microsoft 365 Business Basic"
+  "O365_BUSINESS_PREMIUM"           = "Microsoft 365 Business Standard"
+  "M365_BUSINESS_PREMIUM"           = "Microsoft 365 Business Premium"
+  "EMS"                             = "Enterprise Mobility + Security E3"
+  "EMSPREMIUM"                      = "Enterprise Mobility + Security E5"
+  "ATP_ENTERPRISE"                  = "Defender for Office 365 (Plan 1/2)"
+  "AADPREMIUM"                      = "Entra ID P1"
+  "AADPREMIUM_P2"                   = "Entra ID P2"
+}
+function Map-Sku([string]$sku){ if ($SkuMap.ContainsKey($sku)) { $SkuMap[$sku] } else { $sku } }
 
-if (!($Users)) {
-    Write-Host "No accounts found. Exiting..."
-    exit
-} else {
-    Write-Host "$($Users.Count) Entra ID member accounts found."
+# --- Helper: map @odata.type -> friendly MFA method names ---
+function Get-FriendlyAuth {
+    param($Method)
+    $t = $Method.AdditionalProperties['@odata.type']
+    switch ($t) {
+        "#microsoft.graph.microsoftAuthenticatorAuthenticationMethod"             { ,@("AuthenticatorApp", $Method.AdditionalProperties["displayName"]) }
+        "#microsoft.graph.passwordlessMicrosoftAuthenticatorAuthenticationMethod" { ,@("Passwordless",     $Method.AdditionalProperties["displayName"]) }
+        "#microsoft.graph.phoneAuthenticationMethod"                              { $pt=$Method.AdditionalProperties["phoneType"]; $pn=$Method.AdditionalProperties["phoneNumber"]; ,@("PhoneAuthentication", ("$pt $pn").Trim()) }
+        "#microsoft.graph.fido2AuthenticationMethod"                              { ,@("Fido2",  $Method.AdditionalProperties["model"]) }
+        "#microsoft.graph.windowsHelloForBusinessAuthenticationMethod"            { ,@("WindowsHelloForBusiness", $Method.AdditionalProperties["displayName"]) }
+        "#microsoft.graph.softwareOathAuthenticationMethod"                       { ,@("TOTP (Software OATH)", $Method.AdditionalProperties["displayName"]) }
+        "#microsoft.graph.emailAuthenticationMethod"                              { ,@("EmailAuthentication", $Method.AdditionalProperties["emailAddress"]) }
+        "#microsoft.graph.temporaryAccessPassAuthenticationMethod"                { ,@("TemporaryAccessPass", "Lifetime (min): " + $Method.AdditionalProperties["lifetimeInMinutes"]) }
+        "#microsoft.graph.passwordAuthenticationMethod"                           { ,@("PasswordAuthentication", $Method.AdditionalProperties["displayName"]) }
+        default                                                                    { ,@("Unknown","") }
+    }
 }
 
-$CheckedUsers = 0
-$Report = [System.Collections.Generic.List[Object]]::new()
+$strong = @("AuthenticatorApp","Passwordless","Fido2","PhoneAuthentication")
 
-foreach ($User in $Users) {
-    # Check if the user is licensed
-    $IsLicensed = $false
-    $Licenses = Get-MgUserLicenseDetail -UserId $User.Id
-    if ($Licenses) {
-        $IsLicensed = $Licenses.Count -gt 0
-    }
+Write-Host "Retrieving member users..."
+[array]$Users = Get-MgUser -All -Filter "userType eq 'Member'"
+if (-not $Users) { Write-Warning "No member users found."; Disconnect-MgGraph; return }
 
-    # Check if user has a recent sign-in
-    [array]$LastSignIn = Get-MgAuditLogSignIn -Filter "UserId eq '$($User.Id)'" -Top 1
-    if ($LastSignIn) {
-        $CheckedUsers++
-        Write-Host "[$CheckedUsers] Sign-in found - checking MFA methods for: $($User.DisplayName)"
-        
-        [array]$MfaData = Get-MgUserAuthenticationMethod -UserId $User.Id
+# Preflight: ensure we can read at least one user's methods (clear error if role/consent missing)
+try {
+    $probe = Get-MgUserAuthenticationMethod -UserId $Users[0].Id -ErrorAction Stop | Out-Null
+} catch {
+    Write-Warning "Can't read authentication methods. You need:"
+    Write-Warning "  • Scope: UserAuthenticationMethod.Read.All (admin-consented)"
+    Write-Warning "  • Role : Authentication Administrator (or Privileged Auth Admin / Global Admin)"
+    Write-Warning "Exact error: $($_.Exception.Message)"
+    throw
+}
 
-        foreach ($MfaMethod in $MfaData) {
-            switch ($MfaMethod.AdditionalProperties["@odata.type"]) {
-                "#microsoft.graph.microsoftAuthenticatorAuthenticationMethod" {
-                    $AuthType = 'AuthenticatorApp'
-                    $AuthTypeDetails = $MfaMethod.AdditionalProperties["displayName"]
-                }
-                "#microsoft.graph.phoneAuthenticationMethod" {
-                    $AuthType = 'PhoneAuthentication'
-                    $AuthTypeDetails = $MfaMethod.AdditionalProperties["phoneType", "phoneNumber"] -join ' '
-                }
-                "#microsoft.graph.fido2AuthenticationMethod" {
-                    $AuthType = 'Fido2'
-                    $AuthTypeDetails = $MfaMethod.AdditionalProperties["model"]
-                }
-                "#microsoft.graph.passwordAuthenticationMethod" {
-                    $AuthType = 'PasswordAuthentication'
-                    $AuthTypeDetails = $MfaMethod.AdditionalProperties["displayName"]
-                }
-                "#microsoft.graph.windowsHelloForBusinessAuthenticationMethod" {
-                    $AuthType = 'WindowsHelloForBusiness'
-                    $AuthTypeDetails = $MfaMethod.AdditionalProperties["displayName"]
-                }
-                "#microsoft.graph.emailAuthenticationMethod" {
-                    $AuthType = 'EmailAuthentication'
-                    $AuthTypeDetails = $MfaMethod.AdditionalProperties["emailAddress"]
-                }
-                "microsoft.graph.temporaryAccessPassAuthenticationMethod" {
-                    $AuthType = 'TemporaryAccessPass'
-                    $AuthTypeDetails = 'Lifetime (min): ' + $MfaMethod.AdditionalProperties["lifetimeInMinutes"]
-                }
-                "#microsoft.graph.passwordlessMicrosoftAuthenticatorAuthenticationMethod" {
-                    $AuthType = 'Passwordless'
-                    $AuthTypeDetails = $MfaMethod.AdditionalProperties["displayName"]
-                }
-                "#microsoft.graph.softwareOathAuthenticationMethod" {
-                    $AuthType = 'Third-party Authenticator App'
-                    $AuthTypeDetails = $MfaMethod.AdditionalProperties["displayName"]
-                }
-            }
+$rows   = [System.Collections.Generic.List[object]]::new()
+$errors = [System.Collections.Generic.List[object]]::new()
 
-            $ReportLine = [PSCustomObject][Ordered]@{
-                User          = $User.DisplayName
-                UPN           = $User.UserPrincipalName
-                Method        = $AuthType
-                Details       = $AuthTypeDetails
-                LastSignIn    = $LastSignIn.CreatedDateTime
-                LastSignInApp = $LastSignIn.AppDisplayName
-                IsLicensed    = $IsLicensed
-            }
-            $Report.Add($ReportLine)
+$i = 0
+foreach ($u in $Users) {
+    $i++; if ($i % 50 -eq 0) { Write-Host "Processed $i / $($Users.Count) users..." }
+
+    # --- License check ---
+    $isLicensed = $false
+    $licenseNames = @()
+    try {
+        $lic = Get-MgUserLicenseDetail -UserId $u.Id -ErrorAction SilentlyContinue
+        if ($lic) {
+            $isLicensed = $lic.Count -gt 0
+            $licenseNames = $lic | ForEach-Object { Map-Sku $_.SkuPartNumber } | Sort-Object -Unique
         }
+    } catch {
+        $errors.Add([PSCustomObject]@{ UPN = $u.UserPrincipalName; Error = "License: $($_.Exception.Message)" })
+    }
+
+    # --- MFA methods ---
+    try {
+        [array]$auth = Get-MgUserAuthenticationMethod -UserId $u.Id -ErrorAction Stop
+
+        $pairs         = foreach ($m in $auth) { Get-FriendlyAuth -Method $m }
+        $methods       = $pairs | ForEach-Object { $_[0] } | Where-Object { $_ } | Sort-Object -Unique
+        $methodDetails = $pairs | ForEach-Object { $_ -join " : " } | Where-Object { $_ }
+
+        $hasMfa    = ($methods | Where-Object { $_ -notin @("PasswordAuthentication","Unknown") }).Count -gt 0
+        $strongMfa = ($methods | Where-Object { $_ -in $strong }).Count -gt 0
+
+        $rows.Add([PSCustomObject]@{
+            User          = $u.DisplayName
+            UPN           = $u.UserPrincipalName
+            IsLicensed    = $isLicensed
+            Licenses      = ($licenseNames -join ", ")
+            MFAEnabled    = if ($hasMfa) { "Yes" } else { "No" }
+            StrongMFA     = $strongMfa
+            Methods       = ($methods -join ", ")
+            MethodDetails = ($methodDetails -join " | ")
+        })
+    } catch {
+        $msg = $_.Exception.Message
+        $errors.Add([PSCustomObject]@{ UPN = $u.UserPrincipalName; Error = "AuthMethods: $msg" })
+        $rows.Add([PSCustomObject]@{
+            User          = $u.DisplayName
+            UPN           = $u.UserPrincipalName
+            IsLicensed    = $isLicensed
+            Licenses      = ($licenseNames -join ", ")
+            MFAEnabled    = "N/A"
+            StrongMFA     = $null
+            Methods       = ""
+            MethodDetails = ""
+        })
     }
 }
 
-# Evaluate strong authentication method usage
-$OutputFile = [System.Collections.Generic.List[Object]]::new()
-[array]$AuthUsers = $Report | Sort-Object UPN -Unique | Select-Object UPN, User, LastSignIn, LastSignInApp, IsLicensed
-
-foreach ($AuthUser in $AuthUsers) {
-    $MFAStatus = $null
-    $Records = $Report | Where-Object { $_.UPN -eq $AuthUser.UPN }
-    $Methods = $Records.Method | Sort-Object -Unique
-
-    switch ($Methods) {
-        "Fido2" { $MFAStatus = "Good" }
-        "PhoneAuthentication" { $MFAStatus = "Good" }
-        "AuthenticatorApp" { $MFAStatus = "Good" }
-        "Passwordless" { $MFAStatus = "Good" }
-        default { $MFAStatus = "Check!" }
-    }
-
-    $ReportLine = [PSCustomObject][Ordered]@{
-        User          = $AuthUser.User
-        UPN           = $AuthUser.UPN
-        Methods       = $Methods -join ", "
-        MFAStatus     = $MFAStatus
-        LastSignIn    = $AuthUser.LastSignIn
-        LastSignInApp = $AuthUser.LastSignInApp
-        IsLicensed    = $AuthUser.IsLicensed
-    }
-    $OutputFile.Add($ReportLine)
+# Show + export
+$rows | Sort-Object UPN | Out-GridView -Title "MFA Methods + License Status (Per User)"
+$rows | Sort-Object UPN | Export-Csv -NoTypeInformation -Path $CsvOutput
+if ($errors.Count -gt 0) {
+    $errors | Export-Csv -NoTypeInformation -Path "MFA-Methods-Errors.csv"
+    Write-Warning "Some lookups failed. See MFA-Methods-Errors.csv"
 }
+Write-Host "`nSaved: $CsvOutput"
 
-# Output results
-$OutputFile | Out-GridView
-$OutputFile | Export-Csv -NoTypeInformation -Path $CsvOutput
-
-Write-Output "`nMFA status and license information exported to '$CsvOutput'."
-
-# Disconnect session
 Disconnect-MgGraph
